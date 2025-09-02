@@ -1,0 +1,439 @@
+import asyncio
+import logging
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any, Optional
+import random
+import httpx
+import re
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from duckduckgo_search import DDGS
+
+logger = logging.getLogger(__name__)
+
+class WebSearchService:
+    """A robust web search and scraping service using Selenium."""
+    
+    def __init__(self, settings):
+        self.settings = settings
+        self.driver = None
+
+    def _get_driver(self):
+        if self.driver is None:
+            chrome_options = Options()
+            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            try:
+                self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+            except Exception as e:
+                logger.error(f"Failed to initialize Chrome driver: {e}")
+                self.driver = None
+        return self.driver
+
+    async def search(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Search using DuckDuckGo as fallback if Google fails"""
+        try:
+            # Try DuckDuckGo first as it's more reliable
+            return await self._search_duckduckgo(query, max_results)
+        except Exception as e:
+            logger.error(f"DuckDuckGo search failed: {e}")
+            # Try Google search as fallback
+            return await self._search_google(query, max_results)
+    
+    async def _search_duckduckgo(self, query: str, max_results: int) -> List[Dict[str, Any]]:
+        """Search using DuckDuckGo Search API."""
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            
+            formatted_results = []
+            for r in results:
+                formatted_results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                    "source": "DuckDuckGo"
+                })
+            
+            return formatted_results
+        except Exception as e:
+            logger.error(f"DuckDuckGo search failed: {e}")
+            return []
+
+    async def _search_google(self, query: str, max_results: int) -> List[Dict[str, Any]]:
+        """Fallback Google search using Selenium"""
+        driver = self._get_driver()
+        if not driver:
+            return []
+            
+        results = []
+        try:
+            search_url = f"https://www.google.com/search?q={query}"
+            driver.get(search_url)
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            
+            for g in soup.find_all('div', class_='g'):
+                a_tag = g.find('a', href=True)
+                h3_tag = g.find('h3')
+                if a_tag and h3_tag:
+                    url = a_tag['href']
+                    title = h3_tag.get_text()
+                    snippet_div = g.find('div', style="display:inline-block") or g.find('span')
+                    snippet = snippet_div.get_text() if snippet_div else ""
+                    
+                    if url.startswith('/url?q='):
+                        url = url.split('/url?q=')[1].split('&sa=U')[0]
+                    
+                    if url and not url.startswith('https://www.google.com/'):
+                        results.append({
+                            "title": title,
+                            "url": url,
+                            "snippet": snippet,
+                            "source": "Google"
+                        })
+                        if len(results) >= max_results:
+                            break
+        except Exception as e:
+            logger.error(f"Error during Google search: {e}")
+        return results
+    
+    async def scrape_url(self, url: str) -> Dict[str, Any]:
+        """Scrape content from a URL using httpx first, Selenium as fallback"""
+        try:
+            # Try httpx first (faster and more reliable)
+            async with httpx.AsyncClient(
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                },
+                follow_redirects=True,
+                timeout=20
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.text, 'lxml')
+                
+                # Remove unwanted elements
+                for element in soup(["script", "style", "nav", "footer", "aside", "header"]):
+                    element.decompose()
+                
+                title = soup.find('title').get_text(strip=True) if soup.find('title') else ""
+                
+                # Extract main content
+                main_content = (
+                    soup.find('main') or 
+                    soup.find('article') or 
+                    soup.find('div', class_=re.compile(r'content|main|article', re.I)) or
+                    soup.find('body')
+                )
+                
+                if main_content:
+                    text_elements = main_content.stripped_strings
+                    text = ' '.join(text_elements)
+                    text = text[:5000] if text else ""
+                else:
+                    text = ""
+                
+                return {"url": url, "title": title, "content": text, "success": True}
+                
+        except Exception as e:
+            logger.warning(f"httpx scraping failed for {url}: {e}, trying Selenium...")
+            
+            # Fallback to Selenium
+            driver = self._get_driver()
+            if not driver:
+                return {"url": url, "error": "No driver available", "content": "", "title": ""}
+                
+            try:
+                driver.get(url)
+                soup = BeautifulSoup(driver.page_source, 'lxml')
+                    
+                for script_or_style in soup(["script", "style"]):
+                    script_or_style.decompose()
+                        
+                title = soup.find('title').get_text(strip=True) if soup.find('title') else ""
+                main_content = soup.find('main') or soup.find('article') or soup.find('body')
+                text = ' '.join(t.strip() for t in main_content.stripped_strings) if main_content else ""
+                    
+                return {"url": url, "title": title, "content": text[:5000], "success": True}
+            except Exception as e2:
+                logger.warning(f"Selenium scraping also failed for {url}: {e2}")
+                return {"url": url, "error": str(e2), "content": "", "title": ""}
+    
+    async def search_and_scrape(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Perform search and scrape the results"""
+        logger.info(f"Starting search and scrape for: {query}")
+        
+        search_results = await self.search(query, max_results)
+        if not search_results:
+            logger.warning("No search results found")
+            return []
+        
+        logger.info(f"Found {len(search_results)} search results, starting scraping...")
+        
+        # Scrape each URL
+        scraped_results = []
+        for i, result in enumerate(search_results):
+            try:
+                logger.info(f"Scraping result {i+1}/{len(search_results)}: {result.get('url', 'unknown')}")
+                scraped_content = await self.scrape_url(result['url'])
+                
+                enhanced_result = {
+                    **result,
+                    "scraped_content": scraped_content.get('content', ''),
+                    "scraped_title": scraped_content.get('title', ''),
+                    "scraping_success": scraped_content.get('success', False),
+                    "source": {
+                        "title": result['title'],
+                        "url": result['url'],
+                        "snippet": result['snippet']
+                    }
+                }
+                scraped_results.append(enhanced_result)
+                
+            except Exception as e:
+                logger.error(f"Failed to scrape {result.get('url', 'unknown')}: {e}")
+                enhanced_result = {
+                    **result,
+                    "scraped_content": '',
+                    "scraped_title": '',
+                    "scraping_success": False,
+                    "source": {
+                        "title": result['title'],
+                        "url": result['url'],
+                        "snippet": result['snippet']
+                    }
+                }
+                scraped_results.append(enhanced_result)
+        
+        logger.info(f"Completed scraping for {len(scraped_results)} results")
+        return scraped_results
+
+    def format_search_context(self, search_results: List[Dict[str, Any]]) -> str:
+        """Format search results into a readable context string with source information."""
+        if not search_results:
+            return ""
+        
+        context_parts = []
+        for i, result in enumerate(search_results, 1):
+            title = result.get('title', 'Untitled')
+            url = result.get('url', '')
+            snippet = result.get('snippet', '')
+            scraped_content = result.get('scraped_content', '')
+            
+            # Use scraped content if available, otherwise use snippet
+            content = scraped_content if scraped_content else snippet
+            
+            # Format the source entry
+            source_entry = f"Source {i}: {title}\n"
+            source_entry += f"URL: {url}\n"
+            source_entry += f"Content: {content[:500]}...\n"  # Limit content length
+            
+            context_parts.append(source_entry)
+        
+        return "\n".join(context_parts)
+
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                logger.warning(f"Error closing driver: {e}")
+            finally:
+                self.driver = None
+
+class PrivacyWebSearchService:
+    """A privacy-focused web search service using multiple search engines and rotating user agents."""
+    
+    def __init__(self, settings):
+        self.settings = settings
+        self.user_agents = self._get_user_agents()
+        
+    def _get_user_agents(self) -> List[str]:
+        """Returns a list of common user agents to rotate."""
+        return [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+        ]
+
+    def _get_random_headers(self) -> Dict[str, str]:
+        """Returns randomized headers for privacy."""
+        return {
+            "User-Agent": random.choice(self.user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+
+    async def search(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+        """Perform a web search using DuckDuckGo"""
+        logger.info(f"Performing privacy search for: '{query}'")
+        return await self._search_duckduckgo(query, max_results)
+    
+    async def _search_duckduckgo(self, query: str, max_results: int) -> List[Dict[str, Any]]:
+        """Search using DuckDuckGo Search API."""
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            
+            formatted_results = []
+            for r in results:
+                formatted_results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                    "source": "DuckDuckGo",
+                    "privacy_score": 9
+                })
+            
+            return formatted_results
+        except Exception as e:
+            logger.error(f"DuckDuckGo search failed: {e}")
+            return []
+
+    async def search_and_scrape(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Perform a search and then scrape the content of the top results."""
+        logger.info(f"Starting privacy search and scrape for: {query}")
+        
+        search_results = await self.search(query, max_results)
+        if not search_results:
+            logger.warning("No search results found")
+            return []
+        
+        logger.info(f"Found {len(search_results)} search results, starting scraping...")
+        
+        # Scrape each URL
+        scraped_results = []
+        for i, result in enumerate(search_results):
+            try:
+                logger.info(f"Scraping result {i+1}/{len(search_results)}: {result.get('url', 'unknown')}")
+                scraped_content = await self.scrape_url(result['url'])
+                
+                enhanced_result = {
+                    **result,
+                    "scraped_content": scraped_content.get('content', ''),
+                    "scraped_title": scraped_content.get('title', ''),
+                    "scraping_success": scraped_content.get('success', False)
+                }
+                scraped_results.append(enhanced_result)
+                
+            except Exception as e:
+                logger.error(f"Failed to scrape {result.get('url', 'unknown')}: {e}")
+                enhanced_result = {
+                    **result,
+                    "scraped_content": '',
+                    "scraped_title": '',
+                    "scraping_success": False
+                }
+                scraped_results.append(enhanced_result)
+                
+        logger.info(f"Completed privacy scraping for {len(scraped_results)} results")
+        return scraped_results
+
+    async def scrape_url(self, url: str) -> Dict[str, Any]:
+        """Scrape a single URL with proper error handling."""
+        if not url or not url.startswith(('http://', 'https://')):
+            return {"url": url, "error": "Invalid URL", "content": "", "title": ""}
+        
+        async with httpx.AsyncClient(
+            headers=self._get_random_headers(), 
+            follow_redirects=True, 
+            timeout=20
+        ) as client:
+            try:
+                logger.info(f"Scraping URL: {url}")
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.text, 'lxml')
+                
+                # Remove unwanted elements
+                for element in soup(["script", "style", "nav", "footer", "aside", "header"]):
+                    element.decompose()
+                    
+                # Extract title
+                title = ""
+                if soup.find('title'):
+                    title = soup.find('title').get_text(strip=True)
+                
+                # Extract main content
+                main_content = (
+                    soup.find('main') or 
+                    soup.find('article') or 
+                    soup.find('div', class_=re.compile(r'content|main|article', re.I)) or
+                    soup.find('body')
+                )
+                
+                if main_content:
+                    # Get all text, removing extra whitespace
+                    text_elements = main_content.stripped_strings
+                    text = ' '.join(text_elements)
+                    # Limit content length
+                    text = text[:5000] if text else ""
+                else:
+                    text = ""
+                
+                return {
+                    "url": url, 
+                    "title": title, 
+                    "content": text,
+                    "success": True
+                }
+                
+            except httpx.TimeoutException:
+                logger.warning(f"Timeout scraping {url}")
+                return {"url": url, "error": "Timeout", "content": "", "title": ""}
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"HTTP error {e.response.status_code} scraping {url}")
+                return {"url": url, "error": f"HTTP {e.response.status_code}", "content": "", "title": ""}
+            except Exception as e:
+                logger.warning(f"Error scraping {url}: {e}")
+                return {"url": url, "error": str(e), "content": "", "title": ""}
+
+    def format_search_context(self, search_results: List[Dict[str, Any]]) -> str:
+        """Format search results into a readable context string with source information."""
+        if not search_results:
+            return ""
+        
+        context_parts = []
+        for i, result in enumerate(search_results, 1):
+            title = result.get('title', 'Untitled')
+            url = result.get('url', '')
+            snippet = result.get('snippet', '')
+            scraped_content = result.get('scraped_content', '')
+            
+            # Use scraped content if available, otherwise use snippet
+            content = scraped_content if scraped_content else snippet
+            
+            # Format the source entry with proper reference
+            source_entry = f"**Source {i}: {title}**\n"
+            source_entry += f"URL: {url}\n"
+            source_entry += f"Content: {content[:500]}...\n"
+            
+            context_parts.append(source_entry)
+        
+        return "\n".join(context_parts)
+
+    def close(self):
+        """Close any resources."""
+        logger.info("Privacy web search service closed")
+
+# Factory function to get the appropriate search service
+def get_search_service(settings: Any) -> WebSearchService:
+    """Factory function to get the appropriate search service."""
+    # Always use the privacy-focused service by default
+    return PrivacyWebSearchService(settings)
