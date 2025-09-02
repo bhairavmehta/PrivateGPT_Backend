@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # Backend API Service
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - DEBUG=false
+    volumes:
+      # Mount directories for persistent data
+      - ./models:/app/models
+      - ./templates:/app/templates  
+      - ./temp_files:/app/temp_files
+      - ./logs:/app/logs
+      # Mount source code for development (remove in production)
+      - ./:/app
+    networks:
+      - llm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: llm-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_URL=/api
+    depends_on:
+      - backend
+    networks:
+      - llm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Redis for caching (uncomment if needed)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: llm-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   networks:
+  #     - llm-network
+  #   restart: unless-stopped
+  #   command: redis-server --appendonly yes
+
+networks:
+  llm-network:
+    driver: bridge
+
+volumes:
+  # Create named volumes for persistent data
+  models_data:
+    driver: local
+  templates_data:
+    driver: local
+  temp_files_data:
+    driver: local
+  logs_data:
+    driver: local
+  # redis_data:
+  #   driver: local 
