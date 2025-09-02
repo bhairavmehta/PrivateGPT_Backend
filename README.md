@@ -1,5 +1,4 @@
 # Private LLM Backend: Advanced AI Assistant Platform  
-Repository: [private-gpt-backend](https://github.com/piyushgit011/private-gpt-backend.git)
 
 ## 📖 Project Overview  
 The **Private LLM Backend** represents a revolutionary approach to personal AI assistance, combining the power of multiple specialized Large Language Models with advanced research capabilities, file processing intelligence, and professional report generation—**all running completely locally on your machine**.  
